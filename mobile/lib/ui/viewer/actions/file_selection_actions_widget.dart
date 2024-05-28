@@ -1,4 +1,5 @@
 import "dart:async";
+import "dart:io";
 
 import 'package:fast_base58/fast_base58.dart';
 import "package:flutter/cupertino.dart";
@@ -6,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import "package:logging/logging.dart";
 import "package:modal_bottom_sheet/modal_bottom_sheet.dart";
+import "package:path_provider/path_provider.dart";
 import 'package:photos/core/configuration.dart';
 import "package:photos/core/event_bus.dart";
 import "package:photos/events/people_changed_event.dart";
@@ -43,6 +45,7 @@ import 'package:photos/utils/magic_util.dart';
 import 'package:photos/utils/navigation_util.dart';
 import "package:photos/utils/share_util.dart";
 import 'package:photos/utils/toast_util.dart';
+import "package:screenshot/screenshot.dart";
 
 class FileSelectionActionsWidget extends StatefulWidget {
   final GalleryType type;
@@ -74,7 +77,7 @@ class _FileSelectionActionsWidgetState
   late FilesSplit split;
   late CollectionActions collectionActions;
   late bool isCollectionOwner;
-
+  ScreenshotController screenshotController = ScreenshotController();
   // _cachedCollectionForSharedLink is primarily used to avoid creating duplicate
   // links if user keeps on creating Create link button after selecting
   // few files. This link is reset on any selection changed;
@@ -603,22 +606,47 @@ class _FileSelectionActionsWidgetState
     }
   }
 
+  Future<String> saveImage(Uint8List bytes) async {
+    String path = "";
+    try {
+      final Directory root = await getTemporaryDirectory();
+      final String directoryPath = '${root.path}/enteTempFiles';
+      // Create the directory if it doesn't exist
+      final DateTime timeStamp = DateTime.now();
+      await Directory(directoryPath).create(recursive: true);
+      final String filePath = '$directoryPath/$timeStamp.jpg';
+      final file = await File(filePath).writeAsBytes(bytes!);
+      path = file.path;
+    } catch (e) {
+      debugPrint(e.toString());
+    }
+    return path;
+  }
+
   ValueNotifier<String?> generatedPathNotifier = ValueNotifier<String?>(null);
 //Future function to go to next page
   Future<String?> _nextPageForTesting(List<EnteFile> tempfile) async {
-    final String? tempImagePath = await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (context) => ShowImagePreviewFromTap(
-          tempEnteFile: tempfile,
-        ),
-      ),
+    // final String? tempImagePath = await Navigator.of(context).push(
+    //   MaterialPageRoute(
+    //     builder: (context) => ShowImagePreviewFromTap(
+    //       tempEnteFile: tempfile,
+    //     ),
+    //   ),
+    // );
+    final Widget imageWidget = ShowImagePreviewFromTap(
+      tempEnteFile: tempfile,
+    );
+    await Future.delayed(const Duration(milliseconds: 100));
+    final double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+    final bytesOfImageToWidget = await screenshotController.captureFromWidget(
+      imageWidget,
+      pixelRatio: pixelRatio,
+      targetSize: MediaQuery.of(context).size,
+      delay: const Duration(milliseconds: 100),
     );
 
-    if (tempImagePath != null) {
-      print("Temp image path: $tempImagePath");
-
-      return tempImagePath;
-    }
+    final String tempImagePath = await saveImage(bytesOfImageToWidget);
+    print("Temp image path: $tempImagePath");
     return tempImagePath;
   }
 
@@ -645,13 +673,6 @@ class _FileSelectionActionsWidgetState
           shouldStickToDarkTheme: true,
           buttonAction: ButtonAction.first,
           isInAlert: true,
-          // onTap: () async {
-          //   // Add a return statement at the end of the function
-          //   generatedPathNotifier.value =
-          //       await _nextPageForTesting(tempEnteFile);
-          //   await shareText(generatedPathNotifier.value!);
-          //   return Future<void>.value();
-          // },
         ),
         ButtonWidget(
           labelText: S.of(context).manageLink,
@@ -676,7 +697,7 @@ class _FileSelectionActionsWidgetState
     );
     if (actionResult?.action != null) {
       if (actionResult!.action == ButtonAction.first) {
-        //generatedPathNotifier.value = await _nextPageForTesting(tempEnteFile);
+        generatedPathNotifier.value = await _nextPageForTesting(tempEnteFile);
         await _copyLink();
       }
       if (actionResult.action == ButtonAction.second) {
@@ -796,8 +817,8 @@ class _FileSelectionActionsWidgetState
       );
       final String url =
           "${_cachedCollectionForSharedLink!.publicURLs?.first?.url}#$collectionKey";
-      await shareText(url);
-      //await shareImageAndUrl(context, generatedPathNotifier.value!, url);
+      //await shareText(url);
+      await shareImageAndUrl(context, generatedPathNotifier.value!, url);
       await Clipboard.setData(ClipboardData(text: url));
       showShortToast(context, S.of(context).linkCopiedToClipboard);
     }

@@ -45,10 +45,9 @@ class Captures {
     return null;
   }
 
-  Future<String> saveImage(GlobalKey key) async {
+  Future<String> saveImage(Uint8List bytes) async {
     String path = "";
     try {
-      final Uint8List? bytes = await capture(key);
       final Directory root = await getTemporaryDirectory();
       final String directoryPath = '${root.path}/enteTempFiles';
       // Create the directory if it doesn't exist
