@@ -192,17 +192,21 @@ class SemanticSearchService {
           ),
         )
         .toList();
-    final List<double> allNorms = [];
+    double minNorm = 1;
+    double maxNorm = 1;
     for (final vector in _cachedVectors) {
       final norm = vector.embedding.norm();
-      allNorms.add(norm);
+      if (norm < minNorm) {
+        minNorm = norm;
+      }
+      if (norm > maxNorm) {
+        maxNorm = norm;
+      }
       assert(
         (1 - norm).abs() < 1e-3,
         "Embedding vector is not normalized, norm: ${vector.embedding.norm()}",
       );
     }
-    final maxNorm = allNorms.reduce((value, element) => value > element ? value : element);
-    final minNorm = allNorms.reduce((value, element) => value < element ? value : element);
     _logger
         .info('For all embeddings the minimum norm is $minNorm and the maximum norm is $maxNorm');
     final endTime = DateTime.now();
@@ -388,7 +392,7 @@ class SemanticSearchService {
     //     "imageEmbeddings": _cachedVectors,
     //     "textEmbedding": textEmbedding,
     //   },
-    //   taskName: "computeBulkScore",
+    //   taskName: "computeBulkScoreFaster",
     // );
     final endTime = DateTime.now();
     _logger.info(
