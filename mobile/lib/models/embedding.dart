@@ -1,5 +1,7 @@
 import "dart:convert";
 
+import "package:ml_linalg/vector.dart";
+
 class Embedding {
   final int fileID;
   final Model model;
@@ -19,6 +21,28 @@ class Embedding {
 
   static String encodeEmbedding(List<double> embedding) {
     return jsonEncode(embedding);
+  }
+}
+
+class EmbeddingVector {
+  final int fileID;
+  final Model model;
+  final Vector embedding;
+  int? updationTime;
+
+  EmbeddingVector({
+    required this.fileID,
+    required this.model,
+    required this.embedding,
+    this.updationTime,
+  });
+
+  static Vector decodeEmbedding(String embedding) {
+    return Vector.fromList(List<double>.from(jsonDecode(embedding) as List));
+  }
+
+  static String encodeEmbedding(Vector embedding) {
+    return jsonEncode(embedding.toList());
   }
 }
 

@@ -3,7 +3,9 @@ import "dart:collection";
 import "dart:math" show min;
 
 import "package:computer/computer.dart";
+import "package:flutter/foundation.dart" show kDebugMode;
 import "package:logging/logging.dart";
+import "package:ml_linalg/linalg.dart";
 import "package:photos/core/cache/lru_map.dart";
 import "package:photos/core/configuration.dart";
 import "package:photos/core/event_bus.dart";
@@ -13,6 +15,7 @@ import "package:photos/events/diff_sync_complete_event.dart";
 import 'package:photos/events/embedding_updated_event.dart';
 import "package:photos/events/file_uploaded_event.dart";
 import "package:photos/events/machine_learning_control_event.dart";
+import "package:photos/extensions/stop_watch.dart";
 import "package:photos/models/embedding.dart";
 import "package:photos/models/file/file.dart";
 import "package:photos/services/collections_service.dart";
@@ -29,8 +32,7 @@ import "package:photos/utils/thumbnail_util.dart";
 class SemanticSearchService {
   SemanticSearchService._privateConstructor();
 
-  static final SemanticSearchService instance =
-      SemanticSearchService._privateConstructor();
+  static final SemanticSearchService instance = SemanticSearchService._privateConstructor();
   static final Computer _computer = Computer.shared();
   static final LRUMap<String, List<double>> _queryCache = LRUMap(20);
 
@@ -51,6 +53,7 @@ class SemanticSearchService {
   bool _isComputingEmbeddings = false;
   bool _isSyncing = false;
   List<Embedding> _cachedEmbeddings = <Embedding>[];
+  List<EmbeddingVector> _cachedVectors = <EmbeddingVector>[];
   Future<(String, List<EnteFile>)>? _searchScreenRequest;
   String? _latestPendingQuery;
 
@@ -67,8 +70,7 @@ class SemanticSearchService {
       return;
     }
     _hasInitialized = true;
-    final shouldDownloadOverMobileData =
-        Configuration.instance.shouldBackupOverMobileData();
+    final shouldDownloadOverMobileData = Configuration.instance.shouldBackupOverMobileData();
     _currentModel = await _getCurrentModel();
     _mlFramework = _currentModel == Model.onnxClip
         ? ONNX(shouldDownloadOverMobileData)
@@ -85,8 +87,7 @@ class SemanticSearchService {
       // Diff sync is complete, we can now pull embeddings from remote
       unawaited(sync());
     });
-    if (Configuration.instance.hasConfiguredAccount() &&
-        kShouldPushEmbeddings) {
+    if (Configuration.instance.hasConfiguredAccount() && kShouldPushEmbeddings) {
       unawaited(EmbeddingStore.instance.pushEmbeddings());
     }
 
@@ -123,8 +124,7 @@ class SemanticSearchService {
       return;
     }
     _isSyncing = true;
-    final fetchCompleted =
-        await EmbeddingStore.instance.pullEmbeddings(_currentModel);
+    final fetchCompleted = await EmbeddingStore.instance.pullEmbeddings(_currentModel);
     if (fetchCompleted) {
       await _backFill();
     }
@@ -134,8 +134,7 @@ class SemanticSearchService {
   // searchScreenQuery should only be used for the user initiate query on the search screen.
   // If there are multiple call tho this method, then for all the calls, the result will be the same as the last query.
   Future<(String, List<EnteFile>)> searchScreenQuery(String query) async {
-    if (!LocalSettings.instance.hasEnabledMagicSearch() ||
-        !_frameworkInitialization.isCompleted) {
+    if (!LocalSettings.instance.hasEnabledMagicSearch() || !_frameworkInitialization.isCompleted) {
       return (query, <EnteFile>[]);
     }
     // If there's an ongoing request, just update the last query and return its future.
@@ -184,6 +183,21 @@ class SemanticSearchService {
     _logger.info("Pulling cached embeddings");
     final startTime = DateTime.now();
     _cachedEmbeddings = await EmbeddingsDB.instance.getAll(_currentModel);
+    _cachedVectors = _cachedEmbeddings
+        .map(
+          (e) => EmbeddingVector(
+            fileID: e.fileID,
+            model: e.model,
+            embedding: Vector.fromList(e.embedding),
+          ),
+        )
+        .toList();
+    for (final vector in _cachedVectors) {
+      assert(
+        (1 - vector.embedding.norm()).abs() < 1e-3,
+        "Embedding vector is not normalized, norm: ${vector.embedding.norm()}",
+      );
+    }
     final endTime = DateTime.now();
     _logger.info(
       "Loading ${_cachedEmbeddings.length} took: ${(endTime.millisecondsSinceEpoch - startTime.millisecondsSinceEpoch)}ms",
@@ -193,8 +207,7 @@ class SemanticSearchService {
   }
 
   Future<void> _backFill() async {
-    if (!LocalSettings.instance.hasEnabledMagicSearch() ||
-        !MLFramework.kImageEncoderEnabled) {
+    if (!LocalSettings.instance.hasEnabledMagicSearch() || !MLFramework.kImageEncoderEnabled) {
       return;
     }
     await _frameworkInitialization.future;
@@ -223,8 +236,7 @@ class SemanticSearchService {
 
   Future<List<int>> _getFileIDsToBeIndexed() async {
     final uploadedFileIDs = await getIndexableFileIDs();
-    final embeddedFileIDs =
-        await EmbeddingsDB.instance.getFileIDs(_currentModel);
+    final embeddedFileIDs = await EmbeddingsDB.instance.getFileIDs(_currentModel);
 
     uploadedFileIDs.removeWhere(
       (id) => embeddedFileIDs.contains(id),
@@ -241,12 +253,10 @@ class SemanticSearchService {
 
     final queryResults = await _getScores(textEmbedding);
 
-    final filesMap = await FilesDB.instance
-        .getFilesFromIDs(queryResults.map((e) => e.id).toList());
+    final filesMap = await FilesDB.instance.getFilesFromIDs(queryResults.map((e) => e.id).toList());
     final results = <EnteFile>[];
 
-    final ignoredCollections =
-        CollectionsService.instance.getHiddenCollectionIds();
+    final ignoredCollections = CollectionsService.instance.getHiddenCollectionIds();
     final deletedEntries = <int>[];
     for (final result in queryResults) {
       final file = filesMap[result.id];
@@ -365,11 +375,18 @@ class SemanticSearchService {
       },
       taskName: "computeBulkScore",
     );
+    // final List<QueryResult> queryResults = await _computer.compute(
+    //   computeBulkScoreFaster,
+    //   param: {
+    //     "imageEmbeddings": _cachedVectors,
+    //     "textEmbedding": textEmbedding,
+    //   },
+    //   taskName: "computeBulkScore",
+    // );
     final endTime = DateTime.now();
     _logger.info(
       "computingScores took: " +
-          (endTime.millisecondsSinceEpoch - startTime.millisecondsSinceEpoch)
-              .toString() +
+          (endTime.millisecondsSinceEpoch - startTime.millisecondsSinceEpoch).toString() +
           "ms",
     );
     return queryResults;
@@ -398,7 +415,26 @@ class SemanticSearchService {
   }
 }
 
+List<QueryResult> computeBulkScoreFaster(Map args) {
+  final w = (kDebugMode ? EnteWatch('clip cosime similarity calculation faster') : null)?..start();
+  final queryResults = <QueryResult>[];
+  final imageEmbeddings = args["imageEmbeddings"] as List<EmbeddingVector>;
+  final textEmbedding = args["textEmbedding"] as List<double>;
+  final textVector = Vector.fromList(textEmbedding);
+  for (final imageEmbedding in imageEmbeddings) {
+    final cosineSim = imageEmbedding.embedding.dot(textVector);
+    if (cosineSim >= SemanticSearchService.kScoreThreshold) {
+      queryResults.add(QueryResult(imageEmbedding.fileID, cosineSim));
+    }
+  }
+  w?.log('cosine similarity calculation done');
+
+  queryResults.sort((first, second) => second.score.compareTo(first.score));
+  return queryResults;
+}
+
 List<QueryResult> computeBulkScore(Map args) {
+  final w = (kDebugMode ? EnteWatch('clip cosime similarity calculation old') : null)?..start();
   final queryResults = <QueryResult>[];
   final imageEmbeddings = args["imageEmbeddings"] as List<Embedding>;
   final textEmbedding = args["textEmbedding"] as List<double>;
@@ -411,6 +447,7 @@ List<QueryResult> computeBulkScore(Map args) {
       queryResults.add(QueryResult(imageEmbedding.fileID, score));
     }
   }
+  w?.log('cosine similarity calculation done');
 
   queryResults.sort((first, second) => second.score.compareTo(first.score));
   return queryResults;
