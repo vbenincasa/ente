@@ -30,7 +30,7 @@ interface FaceDBSchema extends DBSchema {
     "file-status": {
         key: number;
         value: FileStatus;
-        indexes: { isIndexable: number };
+        indexes: { status: FileStatus["status"] };
     };
 }
 
@@ -38,27 +38,25 @@ interface FileStatus {
     /** The ID of the {@link EnteFile} whose indexing status we represent. */
     fileID: number;
     /**
-     * `1` if this file needs to be indexed, `0` otherwise.
+     * The status of the file.
      *
-     * > Somewhat confusingly, we also have a (IndexedDB) "index" on this field.
-     *   That (IDB) index allows us to efficiently select {@link fileIDs} that
-     *   still need indexing (i.e. entries where {@link isIndexed} is `1`).
+     * - "indexable" - This file is something that we can index, but it is yet
+     *   to be indexed.
      *
-     * [Note: Boolean IndexedDB indexes].
+     * - "indexed" - We have a corresponding entry for this file in the
+     *   "face-index" object (either indexed locally or fetched from remote).
      *
-     * IndexedDB does not (currently) supported indexes on boolean fields.
-     * https://github.com/w3c/IndexedDB/issues/76
+     * - "failed" - Indexing was attempted but failed.
      *
-     * As a workaround, we use numeric fields where `0` denotes `false` and `1`
-     * denotes `true`.
+     * We also have a (IndexedDB) "index" on this field to allow us to
+     * efficiently select or count {@link fileIDs} that fall into various
+     * buckets.
      */
-    isIndexable: number;
+    status: "indexable" | "indexed" | "failed";
     /**
      * The number of times attempts to index this file failed.
      *
-     * This is guaranteed to be `0` for files which have already been
-     * sucessfully indexed (i.e. files for which `isIndexable` is 0 and which
-     * have a corresponding entry in the "face-index" object store).
+     * This is guaranteed to be `0` for files with status "indexed".
      */
     failureCount: number;
 }
@@ -82,6 +80,8 @@ interface FileStatus {
 let _faceDB: ReturnType<typeof openFaceDB> | undefined;
 
 const openFaceDB = async () => {
+    deleteLegacyDB();
+
     const db = await openDB<FaceDBSchema>("face", 1, {
         upgrade(db, oldVersion, newVersion) {
             log.info(`Upgrading face DB ${oldVersion} => ${newVersion}`);
@@ -89,7 +89,7 @@ const openFaceDB = async () => {
                 db.createObjectStore("face-index", { keyPath: "fileID" });
                 db.createObjectStore("file-status", {
                     keyPath: "fileID",
-                }).createIndex("isIndexable", "isIndexable");
+                }).createIndex("status", "status");
             }
         },
         blocking() {
@@ -110,6 +110,13 @@ const openFaceDB = async () => {
         },
     });
     return db;
+};
+
+const deleteLegacyDB = () => {
+    // Delete the legacy face DB.
+    // This code was added June 2024 (v1.7.1-rc) and can be removed once clients
+    // have migrated over.
+    void deleteDB("mldata");
 };
 
 /**
@@ -138,6 +145,7 @@ export const closeFaceDBConnectionsIfNeeded = async () => {
  * Meant to be called during logout.
  */
 export const clearFaceData = async () => {
+    deleteLegacyDB();
     await closeFaceDBConnectionsIfNeeded();
     return deleteDB("face", {
         blocked() {
@@ -166,11 +174,19 @@ export const saveFaceIndex = async (faceIndex: FaceIndex) => {
         indexStore.put(faceIndex),
         statusStore.put({
             fileID: faceIndex.fileID,
-            isIndexable: 0,
+            status: "indexed",
             failureCount: 0,
         }),
         tx.done,
-    ]);
+    ]).then(() => {} /* convert result to void */);
+};
+
+/**
+ * Return the {@link FaceIndex}, if any, for {@link fileID}.
+ */
+export const faceIndex = async (fileID: number) => {
+    const db = await faceDB();
+    return db.get("face-index", fileID);
 };
 
 /**
@@ -190,11 +206,76 @@ export const addFileEntry = async (fileID: number) => {
     if ((await tx.store.getKey(fileID)) === undefined) {
         await tx.store.put({
             fileID,
-            isIndexable: 1,
+            status: "indexable",
             failureCount: 0,
         });
     }
     return tx.done;
+};
+
+/**
+ * Sync entries in the face DB to align with the state of local files outside
+ * face DB.
+ *
+ * @param localFileIDs Local {@link EnteFile}s, keyed by their IDs. These are
+ * all the files that the client is aware of, filtered to only keep the files
+ * that the user owns and the formats that can be indexed by our current face
+ * indexing pipeline.
+ *
+ * This function syncs the state of file entries in face DB to the state of file
+ * entries stored otherwise by the client locally.
+ *
+ * - Files (identified by their ID) that are present locally but are not yet in
+ *   face DB get a fresh entry in face DB (and are marked as indexable).
+ *
+ * - Files that are not present locally but still exist in face DB are removed
+ *   from face DB (including its face index, if any).
+ */
+export const syncWithLocalFiles = async (localFileIDs: number[]) => {
+    const db = await faceDB();
+    const tx = db.transaction(["face-index", "file-status"], "readwrite");
+    const fdbFileIDs = await tx.objectStore("file-status").getAllKeys();
+
+    const local = new Set(localFileIDs);
+    const fdb = new Set(fdbFileIDs);
+
+    const newFileIDs = localFileIDs.filter((id) => !fdb.has(id));
+    const removedFileIDs = fdbFileIDs.filter((id) => !local.has(id));
+
+    return Promise.all(
+        [
+            newFileIDs.map((id) =>
+                tx.objectStore("file-status").put({
+                    fileID: id,
+                    status: "indexable",
+                    failureCount: 0,
+                }),
+            ),
+            removedFileIDs.map((id) =>
+                tx.objectStore("file-status").delete(id),
+            ),
+            removedFileIDs.map((id) => tx.objectStore("face-index").delete(id)),
+            tx.done,
+        ].flat(),
+    ).then(() => {} /* convert result to void */);
+};
+
+/**
+ * Return the count of files that can be, and that have been, indexed.
+ *
+ * These counts are mutually exclusive. The total number of files that fall
+ * within the purview of the indexer is thus indexable + indexed.
+ */
+export const indexedAndIndexableCounts = async () => {
+    const db = await faceDB();
+    const tx = db.transaction("file-status", "readwrite");
+    const indexableCount = await tx.store
+        .index("status")
+        .count(IDBKeyRange.only("indexable"));
+    const indexedCount = await tx.store
+        .index("status")
+        .count(IDBKeyRange.only("indexed"));
+    return { indexableCount, indexedCount };
 };
 
 /**
@@ -203,12 +284,16 @@ export const addFileEntry = async (fileID: number) => {
  * This list is from the universe of the file IDs that the face DB knows about
  * (can use {@link addFileEntry} to inform it about new files). From this
  * universe, we filter out fileIDs the files corresponding to which have already
- * been indexed, or for which we attempted indexing but failed.
+ * been indexed, or which should be ignored.
+ *
+ * @param count Limit the result to up to {@link count} items.
  */
-export const unindexedFileIDs = async () => {
+export const indexableFileIDs = async (count?: number) => {
     const db = await faceDB();
     const tx = db.transaction("file-status", "readonly");
-    return tx.store.index("isIndexable").getAllKeys(IDBKeyRange.only(1));
+    return tx.store
+        .index("status")
+        .getAllKeys(IDBKeyRange.only("indexable"), count);
 };
 
 /**
@@ -223,10 +308,10 @@ export const unindexedFileIDs = async () => {
 export const markIndexingFailed = async (fileID: number) => {
     const db = await faceDB();
     const tx = db.transaction("file-status", "readwrite");
-    const failureCount = ((await tx.store.get(fileID)).failureCount ?? 0) + 1;
+    const failureCount = ((await tx.store.get(fileID))?.failureCount ?? 0) + 1;
     await tx.store.put({
         fileID,
-        isIndexable: 0,
+        status: "failed",
         failureCount,
     });
     return tx.done;
